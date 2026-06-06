@@ -1,0 +1,7 @@
+# Fichiers exécutables et objets générés par la compilation
+*.exe
+*.o
+# Paramètres de VS Code
+.vscode/
+# Bibliothèque audio externe téléchargée manuellement
+miniaudio.h
