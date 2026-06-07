@@ -2,11 +2,13 @@
 #include "miniaudio.h"
 #include <stdio.h>
 #include <string.h>
+#include <windows.h>
 
 #define SAMPLE_RATE    44100
 #define MAX_LOOP_SEC   30
 #define MAX_SAMPLES    (SAMPLE_RATE * MAX_LOOP_SEC)
 #define NUM_TRACKS     2
+#define VU_WIDTH       16
 
 typedef enum {
     STATE_IDLE,
@@ -14,6 +16,14 @@ typedef enum {
     STATE_PLAYING,
     STATE_OVERDUBBING
 } LooperState;
+
+/* Noms des etats pour l'affichage */
+const char* state_name[] = {
+    "IDLE      ",
+    "RECORDING ",
+    "PLAYING   ",
+    "OVERDUB   "
+};
 
 typedef struct {
     float       buffer[MAX_SAMPLES];
@@ -23,14 +33,14 @@ typedef struct {
     LooperState state;
 } LoopTrack;
 
-/* Je regroupe les deux pistes et les informations partagees
-   dans une seule structure.
-   master_loop_length : fixe par la track 1, impose aux suivantes
-   active_track       : indice de la piste actuellement pilotee */
 typedef struct {
-    LoopTrack tracks[NUM_TRACKS];
-    int       master_loop_length;
-    int       active_track;
+    LoopTrack      tracks[NUM_TRACKS];
+    int            master_loop_length;
+    int            active_track;
+    /* volatile : indique au compilateur que cette valeur
+       peut changer a tout moment depuis un autre thread.
+       Le compilateur ne la mettra pas en cache. */
+    volatile float vu_level;
 } LooperContext;
 
 static LooperContext g_ctx;
@@ -46,6 +56,7 @@ void context_init(LooperContext* ctx)
     }
     ctx->master_loop_length = 0;
     ctx->active_track       = 0;
+    ctx->vu_level           = 0.0f;
 }
 
 float track_process(LoopTrack* t, float input)
@@ -61,13 +72,9 @@ float track_process(LoopTrack* t, float input)
         case STATE_RECORDING:
             t->buffer[t->write_pos] = input;
             t->write_pos++;
-            /* Arret automatique quand on atteint loop_length :
-               pour la track 1, loop_length = MAX_SAMPLES (pas de limite)
-               pour la track 2, loop_length = master_loop_length (impose) */
             if (t->write_pos >= t->loop_length) {
                 t->read_pos = 0;
                 t->state    = STATE_PLAYING;
-                printf("Track auto-bouclee\n");
             }
             output = input;
             break;
@@ -98,57 +105,43 @@ void pedal_press(LooperContext* ctx)
         case STATE_IDLE:
             t->write_pos = 0;
             t->state     = STATE_RECORDING;
-
             if (ctx->active_track == 0) {
-                /* Track 1 : pas de limite connue a l'avance,
-                   on laisse MAX_SAMPLES comme garde-fou */
                 t->loop_length = MAX_SAMPLES;
-                printf("Track 1 : enregistrement...\n");
             } else {
-                /* Track 2 : la longueur est imposee par la track 1 */
-                if (ctx->master_loop_length == 0) {
-                    printf("Erreur : enregistre d'abord la track 1\n");
-                    t->state = STATE_IDLE;
-                    return;
-                }
+                if (ctx->master_loop_length == 0) return;
                 t->loop_length = ctx->master_loop_length;
-                printf("Track 2 : enregistrement (%.2f sec imposees)...\n",
-                       (float)ctx->master_loop_length / SAMPLE_RATE);
             }
             break;
 
         case STATE_RECORDING:
             if (ctx->active_track == 0) {
-                /* 2e appui sur track 1 : on fixe master_loop_length */
                 t->loop_length          = t->write_pos;
                 ctx->master_loop_length = t->loop_length;
                 t->read_pos             = 0;
                 t->state                = STATE_PLAYING;
-                printf("Track 1 : lecture (%.2f sec)\n",
-                       (float)t->loop_length / SAMPLE_RATE);
             }
-            /* Pour track 2, l'arret est automatique dans track_process */
             break;
 
         case STATE_PLAYING:
             t->state = STATE_OVERDUBBING;
-            printf("Track %d : overdubbing...\n", ctx->active_track + 1);
             break;
 
         case STATE_OVERDUBBING:
             t->state = STATE_PLAYING;
-            printf("Track %d : lecture...\n", ctx->active_track + 1);
             break;
     }
 }
 
-/* Chaque piste est traitee independamment et on mixe les sorties.
-   Un clipping global est applique sur le mix final. */
+/* ── Callback audio ──────────────────────────────────────────────
+   Seule nouveaute : calcul du niveau crete pour le VU-metre.
+   On cherche le sample le plus fort du bloc (valeur absolue max).
+   Pas de printf ici : operation trop lente pour le temps reel. */
 void audio_callback(ma_device* pDevice, void* pOutput,
                     const void* pInput, ma_uint32 frameCount)
 {
-    float*       out = (float*)pOutput;
-    const float* in  = (const float*)pInput;
+    float*       out  = (float*)pOutput;
+    const float* in   = (const float*)pInput;
+    float        peak = 0.0f;
     (void)pDevice;
 
     for (ma_uint32 i = 0; i < frameCount; i++) {
@@ -158,7 +151,83 @@ void audio_callback(ma_device* pDevice, void* pOutput,
         if (mix >  1.0f) mix =  1.0f;
         if (mix < -1.0f) mix = -1.0f;
         out[i] = mix;
+
+        /* Valeur absolue du sample entrant */
+        float abs_in = in[i] < 0 ? -in[i] : in[i];
+        if (abs_in > peak) peak = abs_in;
     }
+
+    /* Ecriture du niveau crete dans la variable partagee */
+    g_ctx.vu_level = peak;
+}
+
+/* ── Affichage ───────────────────────────────────────────────────
+   Dessine une barre ASCII de longueur 'width'.
+   'ratio' entre 0.0 et 1.0 determine la proportion remplie. */
+void draw_bar(float ratio, int width, char full, char empty)
+{
+    int filled = (int)(ratio * width);
+    if (filled > width) filled = width;
+    for (int i = 0; i < width; i++)
+        putchar(i < filled ? full : empty);
+}
+
+void display_refresh(LooperContext* ctx)
+{
+    /* Repositionne le curseur en haut sans effacer l'ecran */
+    COORD pos = {0, 0};
+    SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), pos);
+
+    printf("LOOPER\n\n");
+
+    for (int i = 0; i < NUM_TRACKS; i++) {
+        LoopTrack* t      = &ctx->tracks[i];
+        /* '>' indique la piste active */
+        int        active = (i == ctx->active_track);
+
+        /* Calcul de la progression dans la boucle */
+        float progress = 0.0f;
+        if (t->loop_length > 0) {
+            int pos_in_loop = (t->state == STATE_RECORDING)
+                              ? t->write_pos
+                              : t->read_pos;
+            progress = (float)pos_in_loop / t->loop_length;
+        }
+
+        printf("[TRACK %d]%s ", i + 1, active ? ">" : " ");
+        draw_bar(progress, VU_WIDTH, '#', '-');
+        printf("  %s", state_name[t->state]);
+
+        if (t->loop_length > 0 && t->state != STATE_IDLE)
+            printf("  %.1fs", (float)t->loop_length / SAMPLE_RATE);
+
+        printf("\n");
+    }
+
+    /* VU-metre : affiche le niveau du signal entrant */
+    printf("\nVU-in : [");
+    draw_bar(ctx->vu_level, VU_WIDTH, '=', ' ');
+    printf("]\n");
+
+    printf("\nEntree=pedale | T=changer track | Ctrl+C=quitter\n");
+}
+
+/* Thread d'affichage
+   Tourne en parallele du thread audio et du thread principal.
+   Sleep(100) : rafraichissement toutes les 100ms.
+   On cache le curseur pour un affichage plus propre. */
+DWORD WINAPI display_thread(LPVOID param)
+{
+    (void)param;
+    CONSOLE_CURSOR_INFO ci = {1, FALSE};
+    SetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), &ci);
+    system("cls");
+
+    while (1) {
+        display_refresh(&g_ctx);
+        Sleep(100);
+    }
+    return 0;
 }
 
 int main(void)
@@ -180,19 +249,18 @@ int main(void)
     }
 
     ma_device_start(&device);
-    printf("LOOPER 2 TRACKS\n");
-    printf("Entree = pedale | T = changer de track | Ctrl+C = quitter\n\n");
-    printf("Track 1 active. Pret.\n");
+
+    /* Lancement du thread d'affichage.
+       Il tourne en parallele sans bloquer le thread principal. */
+    CreateThread(NULL, 0, display_thread, NULL, 0, NULL);
 
     char c;
     while (1) {
         c = getchar();
         if (c == '\n')
             pedal_press(&g_ctx);
-        else if (c == 't' || c == 'T') {
+        else if (c == 't' || c == 'T')
             g_ctx.active_track = (g_ctx.active_track + 1) % NUM_TRACKS;
-            printf("Track active : %d\n", g_ctx.active_track + 1);
-        }
     }
 
     ma_device_uninit(&device);
