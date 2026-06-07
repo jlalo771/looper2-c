@@ -7,7 +7,8 @@
    Un float = 4 octets, donc MAX_SAMPLES * 4 = taille en mémoire */
 #define SAMPLE_RATE     44100
 #define MAX_LOOP_SEC    30
-#define MAX_SAMPLES     (SAMPLE_RATE * MAX_LOOP_SEC)
+/* #define MAX_SAMPLES     (SAMPLE_RATE * MAX_LOOP_SEC) */
+#define MAX_SAMPLES 1024
 
 /* Structure buffer circulaire 
    buffer     : le tableau qui stocke les samples
@@ -73,6 +74,6 @@ int main(void){
         }
         printf("\n");
     }
-
+    
     return 0;
 }
