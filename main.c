@@ -7,16 +7,13 @@
 #define MAX_LOOP_SEC    30
 #define MAX_SAMPLES     (SAMPLE_RATE * MAX_LOOP_SEC)
 
-/* enum sert à nommer clairement les etats du looper
-   En memoire, IDLE=0, RECORDING=1, PLAYING=2 */
 typedef enum {
     STATE_IDLE,
     STATE_RECORDING,
-    STATE_PLAYING
+    STATE_PLAYING,
+    STATE_OVERDUBBING /* Ajout */
 } LooperState;
 
-/* static : place la structure dans le segment de donnees
-   et non sur la pile, pour eviter le stack overflow */
 typedef struct {
     float       buffer[MAX_SAMPLES];
     int         write_pos;
@@ -27,8 +24,8 @@ typedef struct {
 
 static LoopTrack g_track;
 
-/* On remet tout a zero : silence et etat IDLE */
-void track_init(LoopTrack* t){
+void track_init(LoopTrack* t)
+{
     memset(t->buffer, 0, sizeof(t->buffer));
     t->write_pos   = 0;
     t->read_pos    = 0;
@@ -36,35 +33,37 @@ void track_init(LoopTrack* t){
     t->state       = STATE_IDLE;
 }
 
-/* Traitement d'un sample
-   Appelee pour chaque sample dans le callback audio.
-   Selon l'etat, on enregistre, on lit, ou on laisse passer. */
-float track_process(LoopTrack* t, float input){
+float track_process(LoopTrack* t, float input)
+{
     float output = 0.0f;
 
     switch (t->state) {
 
         case STATE_IDLE:
-            /* Pas d'enregistrement, pas de lecture :
-               le signal d'entree passe tel quel */
             output = input;
             break;
 
         case STATE_RECORDING:
-            /* Sample entrant ecrit dans le buffer */
             t->buffer[t->write_pos] = input;
             t->write_pos++;
-            /* Securite : bloque si la fin du buffer est atteinte */
             if (t->write_pos >= MAX_SAMPLES)
                 t->write_pos = MAX_SAMPLES - 1;
-            /* Je m'entends en direct pendant l'enregistrement */
             output = input;
             break;
 
         case STATE_PLAYING:
-            /* Sample lu a read_pos */
             output = t->buffer[t->read_pos];
-            /* % loop_length : repart au debut de la boucle quand on arrive a la fin */
+            t->read_pos = (t->read_pos + 1) % t->loop_length;
+            break;
+
+        case STATE_OVERDUBBING:
+            /* On additionne le signal entrant au sample existant */
+            t->buffer[t->read_pos] += input;
+            /* Hard clipping : on force dans [-1.0, 1.0] pour eviter la saturation numerique si on overdub trop */
+            if (t->buffer[t->read_pos] >  1.0f) t->buffer[t->read_pos] =  1.0f;
+            if (t->buffer[t->read_pos] < -1.0f) t->buffer[t->read_pos] = -1.0f;
+            output = t->buffer[t->read_pos];
+            /* Les deux pointeurs avancent ensemble */
             t->read_pos = (t->read_pos + 1) % t->loop_length;
             break;
     }
@@ -72,21 +71,17 @@ float track_process(LoopTrack* t, float input){
     return output;
 }
 
-/* Appui pedale (transitions entre etats) */
-void pedal_press(LoopTrack* t){
+void pedal_press(LoopTrack* t)
+{
     switch (t->state) {
 
         case STATE_IDLE:
-            /* 1er appui : debut de l'enregistrement */
             t->write_pos = 0;
             t->state     = STATE_RECORDING;
             printf("Enregistrement...\n");
             break;
 
         case STATE_RECORDING:
-            /* 2e appui : fin de l'enregistrement
-               On fixe loop_length = nombre de samples enregistres
-               On remet read_pos a 0 pour relire depuis le debut */
             t->loop_length = t->write_pos;
             t->read_pos    = 0;
             t->state       = STATE_PLAYING;
@@ -95,17 +90,23 @@ void pedal_press(LoopTrack* t){
             break;
 
         case STATE_PLAYING:
-            /* 3e appui : retour a l'etat initial */
-            track_init(t);
-            printf("Remis a zero.\n");
+            /* On reste a la meme position dans la boucle
+               pour ne pas sauter lors du passage en overdub */
+            t->state = STATE_OVERDUBBING;
+            printf("Overdubbing...\n");
+            break;
+
+        case STATE_OVERDUBBING:
+            /* Retour en lecture simple */
+            t->state = STATE_PLAYING;
+            printf("Lecture...\n");
             break;
     }
 }
 
-/* Callback audio, appelee ~172 fois par seconde par la carte son.
-   track_process appele pour chaque sample. */
 void audio_callback(ma_device* pDevice, void* pOutput,
-                    const void* pInput, ma_uint32 frameCount){
+                    const void* pInput, ma_uint32 frameCount)
+{
     float*       out = (float*)pOutput;
     const float* in  = (const float*)pInput;
     (void)pDevice;
@@ -115,7 +116,8 @@ void audio_callback(ma_device* pDevice, void* pOutput,
     }
 }
 
-int main(void){
+int main(void)
+{
     track_init(&g_track);
 
     ma_device_config config  = ma_device_config_init(ma_device_type_duplex);
@@ -133,11 +135,10 @@ int main(void){
     }
 
     ma_device_start(&device);
-    printf("LOOPER trop cool\n");
+    printf("LOOPER\n");
     printf("Entree = pedale | Ctrl+C = quitter\n\n");
     printf("Pret.\n");
 
-    /* Boucle principale : chaque appui sur Entree = pedale */
     while (1) {
         getchar();
         pedal_press(&g_track);
